@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import abc
+import contextlib
 import random
+import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
-from .config import AgentConfig, CircuitBreakerConfig, RetryConfig
+from .config import AgentConfig, CircuitBreakerConfig, RateLimitConfig, RetryConfig
 from .observability import Metrics, Tracer
 from .types import LLMResponse, Message, Role, ToolCall, Usage
 
@@ -61,6 +63,47 @@ class CircuitBreaker:
         self.failures += 1
         if self.failures >= self.cfg.failure_threshold:
             self.opened_at = time.monotonic()
+
+
+class RateLimiter:
+    """Process-local rate limiter for provider calls."""
+
+    def __init__(self, cfg: RateLimitConfig) -> None:
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        self._capacity = max(float(cfg.max_calls_per_minute), 0.0)
+        self._tokens = self._capacity
+        self._last_refill = time.monotonic()
+        self._semaphore = (threading.Semaphore(cfg.max_concurrent_calls)
+                           if cfg.max_concurrent_calls > 0 else None)
+
+    @contextlib.contextmanager
+    def slot(self) -> Iterator[None]:
+        if self._semaphore is not None:
+            self._semaphore.acquire()
+        try:
+            self._take_token()
+            yield
+        finally:
+            if self._semaphore is not None:
+                self._semaphore.release()
+
+    def _take_token(self) -> None:
+        if self.cfg.max_calls_per_minute <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                refill_per_s = self.cfg.max_calls_per_minute / 60.0
+                self._tokens = min(self._capacity,
+                                   self._tokens + elapsed * refill_per_s)
+                self._last_refill = now
+                if self._tokens >= 1:
+                    self._tokens -= 1
+                    return
+                wait_s = (1 - self._tokens) / refill_per_s
+            time.sleep(max(wait_s, 0.001))
 
 
 class LLMProvider(abc.ABC):
@@ -228,6 +271,7 @@ class ResilientLLMClient:
         self.tracer = tracer
         self.metrics = metrics
         self.breaker = CircuitBreaker(config.breaker)
+        self.rate_limiter = RateLimiter(config.rate_limit)
 
     def complete(self, *, trace_id: str, system: str, messages: list[Message],
                  tools: list[dict[str, Any]], on_text: OnText | None = None,
@@ -240,19 +284,23 @@ class ResilientLLMClient:
             with self.tracer.span("llm.call", trace_id, attempt=attempt,
                                   model=self.config.model) as ctx:
                 try:
-                    resp = self.provider.complete(
-                        model=self.config.model,
-                        system=system,
-                        messages=messages,
-                        tools=tools,
-                        max_tokens=self.config.max_tokens_per_call,
-                        timeout_s=retry.timeout_s,
-                        caching=self.config.enable_prompt_caching,
-                        on_text=on_text,
-                        thinking=self.config.thinking,
-                        effort=self.config.effort,
-                        output_schema=output_schema,
-                    )
+                    streamed_chunks: list[str] = []
+                    attempt_on_text = (
+                        streamed_chunks.append if on_text is not None else None)
+                    with self.rate_limiter.slot():
+                        resp = self.provider.complete(
+                            model=self.config.model,
+                            system=system,
+                            messages=messages,
+                            tools=tools,
+                            max_tokens=self.config.max_tokens_per_call,
+                            timeout_s=retry.timeout_s,
+                            caching=self.config.enable_prompt_caching,
+                            on_text=attempt_on_text,
+                            thinking=self.config.thinking,
+                            effort=self.config.effort,
+                            output_schema=output_schema,
+                        )
                 except TransientLLMError as e:
                     last_err = e
                     self.breaker.on_failure()
@@ -271,6 +319,9 @@ class ResilientLLMClient:
                 self.metrics.inc("tokens.output", resp.usage.output_tokens)
                 self.metrics.inc("tokens.cache_write", resp.usage.cache_write_tokens)
                 self.metrics.inc("tokens.cache_read", resp.usage.cache_read_tokens)
+                if on_text is not None:
+                    for chunk in streamed_chunks:
+                        on_text(chunk)
                 ctx["input_tokens"] = resp.usage.input_tokens
                 ctx["output_tokens"] = resp.usage.output_tokens
                 ctx["cache_read_tokens"] = resp.usage.cache_read_tokens

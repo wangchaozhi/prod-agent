@@ -42,6 +42,13 @@ class ContextConfig:
 
 
 @dataclass(frozen=True)
+class RateLimitConfig:
+    """进程级 Provider 调用限流。0 表示不限制。"""
+    max_calls_per_minute: float = 0.0
+    max_concurrent_calls: int = 0
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     model: str = "claude-opus-4-8"
     max_tokens_per_call: int = 4096
@@ -56,6 +63,7 @@ class AgentConfig:
     breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     checkpoint_db: str = "agent_checkpoints.db"
     # EXECUTE 级工具审批策略(工具是否需要审批由 ToolRegistry 声明,这里只决定无 hook 时的行为):
     #   "sync"  — 无 approval_hook 时直接拒绝执行(默认,行为可预期)
@@ -71,3 +79,95 @@ class AgentConfig:
         if not key:
             raise RuntimeError("ANTHROPIC_API_KEY 未设置 (密钥只能通过环境变量注入)")
         return key
+
+    @staticmethod
+    def from_env(prefix: str = "PROD_AGENT_") -> "AgentConfig":
+        """Build config from environment variables.
+
+        Examples:
+          PROD_AGENT_MODEL=claude-sonnet-5
+          PROD_AGENT_BUDGET_MAX_COST_USD=1
+          PROD_AGENT_RATE_MAX_CALLS_PER_MINUTE=60
+        """
+
+        def get(name: str, default: str | None = None) -> str | None:
+            return os.environ.get(prefix + name, default)
+
+        def as_int(name: str, default: int) -> int:
+            raw = get(name)
+            return default if raw in (None, "") else int(raw)
+
+        def as_float(name: str, default: float) -> float:
+            raw = get(name)
+            return default if raw in (None, "") else float(raw)
+
+        def as_bool(name: str, default: bool) -> bool:
+            raw = get(name)
+            if raw in (None, ""):
+                return default
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+
+        base = AgentConfig()
+        retry = RetryConfig(
+            max_attempts=as_int("RETRY_MAX_ATTEMPTS", base.retry.max_attempts),
+            base_delay_s=as_float("RETRY_BASE_DELAY_S", base.retry.base_delay_s),
+            max_delay_s=as_float("RETRY_MAX_DELAY_S", base.retry.max_delay_s),
+            jitter=as_float("RETRY_JITTER", base.retry.jitter),
+            timeout_s=as_float("RETRY_TIMEOUT_S", base.retry.timeout_s),
+        )
+        breaker = CircuitBreakerConfig(
+            failure_threshold=as_int("BREAKER_FAILURE_THRESHOLD",
+                                     base.breaker.failure_threshold),
+            recovery_time_s=as_float("BREAKER_RECOVERY_TIME_S",
+                                     base.breaker.recovery_time_s),
+        )
+        budget = BudgetConfig(
+            max_iterations=as_int("BUDGET_MAX_ITERATIONS",
+                                  base.budget.max_iterations),
+            max_total_tokens=as_int("BUDGET_MAX_TOTAL_TOKENS",
+                                    base.budget.max_total_tokens),
+            max_cost_usd=as_float("BUDGET_MAX_COST_USD",
+                                  base.budget.max_cost_usd),
+            max_wall_time_s=as_float("BUDGET_MAX_WALL_TIME_S",
+                                     base.budget.max_wall_time_s),
+            price_per_mtok_input=as_float("PRICE_PER_MTOK_INPUT",
+                                          base.budget.price_per_mtok_input),
+            price_per_mtok_output=as_float("PRICE_PER_MTOK_OUTPUT",
+                                           base.budget.price_per_mtok_output),
+            price_per_mtok_cache_write=as_float(
+                "PRICE_PER_MTOK_CACHE_WRITE",
+                base.budget.price_per_mtok_cache_write),
+            price_per_mtok_cache_read=as_float(
+                "PRICE_PER_MTOK_CACHE_READ",
+                base.budget.price_per_mtok_cache_read),
+        )
+        context = ContextConfig(
+            max_context_tokens=as_int("CONTEXT_MAX_TOKENS",
+                                      base.context.max_context_tokens),
+            keep_recent_messages=as_int("CONTEXT_KEEP_RECENT_MESSAGES",
+                                        base.context.keep_recent_messages),
+        )
+        rate_limit = RateLimitConfig(
+            max_calls_per_minute=as_float("RATE_MAX_CALLS_PER_MINUTE",
+                                          base.rate_limit.max_calls_per_minute),
+            max_concurrent_calls=as_int("RATE_MAX_CONCURRENT_CALLS",
+                                        base.rate_limit.max_concurrent_calls),
+        )
+        return AgentConfig(
+            model=get("MODEL", base.model) or base.model,
+            max_tokens_per_call=as_int("MAX_TOKENS_PER_CALL",
+                                       base.max_tokens_per_call),
+            thinking=get("THINKING", base.thinking),
+            effort=get("EFFORT", base.effort),
+            system_prompt=get("SYSTEM_PROMPT", base.system_prompt) or base.system_prompt,
+            retry=retry,
+            breaker=breaker,
+            budget=budget,
+            context=context,
+            rate_limit=rate_limit,
+            checkpoint_db=get("CHECKPOINT_DB", base.checkpoint_db) or base.checkpoint_db,
+            approval_mode=get("APPROVAL_MODE", base.approval_mode) or base.approval_mode,
+            lease_ttl_s=as_float("LEASE_TTL_S", base.lease_ttl_s),
+            enable_prompt_caching=as_bool("ENABLE_PROMPT_CACHING",
+                                          base.enable_prompt_caching),
+        )

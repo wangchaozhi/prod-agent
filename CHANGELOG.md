@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0 (2026-07-03)
+
+新增:
+
+- **Web / HTTP API** — `python -m agent serve`,内置页面支持提交任务、查看详情、
+  取消任务、审批 EXECUTE 工具调用、查看工具列表与 metrics
+- **Demo 业务工具包** — SQLite 驱动的订单/工单/消息/退款工具,覆盖 READ/WRITE/EXECUTE,
+  可作为真实业务工具替换边界
+- **Demo Provider** — 无 API Key 的规则型 provider,用于本地演示完整任务和审批闭环
+- **API 鉴权** — 可通过 `PROD_AGENT_API_TOKEN` / `PROD_AGENT_APPROVAL_TOKEN`
+  启用 Bearer token,审批端点可要求单独 token
+- **审批审计** — `approval_audit` 表记录 task_id、call_id、决定、审批人、理由、时间
+- **Prometheus 文本 metrics** — `/api/metrics?format=prom`
+- **配置外部化** — `AgentConfig.from_env()` 统一读取 `PROD_AGENT_*` 环境变量
+- **进程级限流** — `RateLimitConfig` 支持 Provider 调用频率和并发上限
+- **Worker CLI 与部署模板** — `python -m agent worker`,Dockerfile、Compose、systemd、
+  nginx 示例、`.env.example`、部署安全文档
+- **检查点保留策略** — `CheckpointStore.purge_terminal()` 清理过期终态任务
+
+修复:
+
+- 流式输出在瞬态错误重试时不再重复吐出失败尝试的文本片段
+- HTTP 错误统一为 `{"error":{"code":...,"message":...}}`
+
 ## 0.3.0 (2026-07-03)
 
 新增:

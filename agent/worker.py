@@ -16,6 +16,7 @@ approvals,应由审批系统回调 agent.resume(task_id, approvals=...)。
 from __future__ import annotations
 
 import threading
+import time
 
 from .core import Agent
 from .memory import LeaseConflict
@@ -23,9 +24,14 @@ from .types import TaskStatus
 
 
 class Worker:
-    def __init__(self, agent: Agent, poll_interval_s: float = 5.0) -> None:
+    def __init__(self, agent: Agent, poll_interval_s: float = 5.0,
+                 purge_older_than_days: float = 0.0,
+                 purge_interval_s: float = 3600.0) -> None:
         self.agent = agent
         self.poll_interval_s = poll_interval_s
+        self.purge_older_than_days = purge_older_than_days
+        self.purge_interval_s = purge_interval_s
+        self._last_purge = 0.0
         self._stop = threading.Event()
 
     def run_once(self) -> int:
@@ -43,7 +49,17 @@ class Worker:
     def run_forever(self) -> None:
         while not self._stop.is_set():
             self.run_once()
+            self._purge_if_due()
             self._stop.wait(self.poll_interval_s)
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _purge_if_due(self) -> int:
+        if self.purge_older_than_days <= 0:
+            return 0
+        now = time.monotonic()
+        if now - self._last_purge < self.purge_interval_s:
+            return 0
+        self._last_purge = now
+        return self.agent.store.purge_terminal(self.purge_older_than_days)

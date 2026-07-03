@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prod-agent"
-version = "0.3.0"
+version = "0.4.0"
 description = "生产级通用任务编排 Agent — 零重型依赖,可靠性/可观测性/成本控制/安全内建"
 readme = "README.md"
 requires-python = ">=3.10"

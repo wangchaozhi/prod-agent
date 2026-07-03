@@ -1,0 +1,22 @@
+[Unit]
+Description=prod-agent HTTP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/prod-agent
+EnvironmentFile=/etc/prod-agent/prod-agent.env
+ExecStart=/opt/prod-agent/.venv/bin/python -m agent serve --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+User=prod-agent
+Group=prod-agent
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/prod-agent
+
+[Install]
+WantedBy=multi-user.target

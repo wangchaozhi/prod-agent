@@ -7,14 +7,20 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from types import SimpleNamespace as NS
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agent import (Agent, AgentConfig, BudgetConfig, ContextConfig,
                    ContextCompactor, LeaseConflict, MockProvider, Permission,
-                   RetryConfig, TaskState, TaskStatus, ToolRegistry, ToolSpec,
-                   Worker, estimate_tokens)
+                   RateLimitConfig, RetryConfig, TaskState, TaskStatus,
+                   ToolRegistry, ToolSpec, Worker, build_demo_tools,
+                   estimate_tokens)
 from agent.budget import BudgetTracker
 from agent.config import CircuitBreakerConfig
 from agent.context import COMPACTED_PLACEHOLDER, SUMMARY_PREFIX
@@ -242,6 +248,250 @@ def test_tool_result_truncation():
     print("PASS test_tool_result_truncation")
 
 
+def test_demo_business_tools_idempotency_and_approval():
+    reg = build_demo_tools(_db_path())
+    q = reg.execute(ToolCall("q1", "query_order", {"order_id": "A1001"}))
+    assert not q.is_error and "A1001" in q.content
+
+    call = ToolCall("ticket-call-1", "create_ticket", {
+        "order_id": "A1001",
+        "issue": "package damaged",
+        "priority": "high",
+    })
+    first = reg.execute(call)
+    second = reg.execute(call)
+    assert not first.is_error and not second.is_error
+    assert json.loads(second.content)["idempotent"] is True
+
+    denied = reg.execute(ToolCall("m1", "send_customer_message", {
+        "order_id": "A1001",
+        "channel": "sms",
+        "content": "hello",
+    }), approved=False)
+    assert denied.is_error and "拒绝" in denied.content
+
+    sent = reg.execute(ToolCall("m1", "send_customer_message", {
+        "order_id": "A1001",
+        "channel": "sms",
+        "content": "hello",
+    }), approved=True)
+    assert not sent.is_error and json.loads(sent.content)["ok"] is True
+    print("PASS test_demo_business_tools_idempotency_and_approval")
+
+
+def test_rule_based_demo_provider_approval_flow():
+    from agent.server import RuleBasedDemoProvider
+
+    cfg = _cfg(approval_mode="pause")
+    agent = Agent(RuleBasedDemoProvider(), build_demo_tools(_db_path()), cfg)
+    s1 = agent.run("message customer for order A1001")
+    assert s1.status == TaskStatus.AWAITING_APPROVAL
+    assert s1.pending_approval_ids
+
+    s2 = agent.resume(s1.task_id, approvals={s1.pending_approval_ids[0]: True})
+    assert s2.status == TaskStatus.COMPLETED
+    assert "Tool results" in s2.messages[-1].content
+    print("PASS test_rule_based_demo_provider_approval_flow")
+
+
+def test_checkpoint_list_tasks_purge_and_tool_describe():
+    cfg = _cfg()
+    agent = Agent(MockProvider([]), _tools(), cfg)
+
+    old_done = TaskState(goal="old", status=TaskStatus.COMPLETED)
+    old_done.updated_at = time.time() - 10 * 86400
+    running = TaskState(goal="running", status=TaskStatus.RUNNING)
+    recent_done = TaskState(goal="recent", status=TaskStatus.COMPLETED)
+    agent.store.save(old_done)
+    agent.store.save(running)
+    agent.store.save(recent_done)
+    # save() refreshes updated_at, so age one row directly for retention coverage.
+    with agent.store._lock, agent.store._conn:
+        agent.store._conn.execute(
+            "UPDATE checkpoints SET updated_at=? WHERE task_id=?",
+            (time.time() - 10 * 86400, old_done.task_id),
+        )
+
+    tasks = agent.store.list_tasks(limit=2)
+    assert len(tasks) == 2
+    assert tasks[0].updated_at >= tasks[1].updated_at
+    assert all(t.status == TaskStatus.COMPLETED
+               for t in agent.store.list_tasks(statuses=(TaskStatus.COMPLETED,)))
+
+    assert agent.store.purge_terminal(older_than_days=1) == 1
+    assert agent.store.load(old_done.task_id) is None
+    assert agent.store.load(running.task_id) is not None
+
+    described = {t["name"]: t for t in _tools().describe()}
+    assert described["deploy"]["permission"] == Permission.EXECUTE.value
+    assert described["echo"]["max_result_chars"] == 20_000
+    assert described["echo"]["pass_call_id"] is False
+    print("PASS test_checkpoint_list_tasks_purge_and_tool_describe")
+
+
+def test_http_api_auth_approval_audit_and_errors():
+    from agent.server import AuthConfig, TaskRunner, build_agent, make_handler
+
+    agent = build_agent(
+        "demo",
+        checkpoint_db=_db_path(),
+        business_db=_db_path(),
+    )
+    runner = TaskRunner(agent)
+    httpd = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(runner, auth=AuthConfig("submit-token", "approve-token")),
+    )
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+
+    def req(path, body=None, token="submit-token", raw=None):
+        data = raw
+        headers = {}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(base + path, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8"))
+
+    def wait_status(task_id, statuses):
+        for _ in range(50):
+            _, state = req("/api/tasks/" + task_id)
+            if state["status"] in statuses:
+                return state
+            time.sleep(0.05)
+        raise AssertionError(f"task {task_id} did not reach {statuses}")
+
+    try:
+        status, err = req("/api/health", token=None)
+        assert status == 401 and err["error"]["code"] == "unauthorized"
+        status, err = req("/api/health", token="bad")
+        assert status == 403 and err["error"]["code"] == "forbidden"
+
+        status, err = req("/api/tasks", {"goal": ""})
+        assert status == 400 and err["error"]["code"] == "missing_goal"
+        status, err = req("/api/tasks", raw=b"{", token="submit-token")
+        assert status == 400 and err["error"]["code"] == "invalid_json"
+        status, err = req("/api/tasks/nope")
+        assert status == 404 and err["error"]["code"] == "not_found"
+
+        status, created = req("/api/tasks", {"goal": "query order A1001"})
+        assert status == 202
+        done = wait_status(created["task_id"], {"completed"})
+        assert "A1001" in done["answer"]
+
+        assert req("/api/tasks")[1]["tasks"]
+        assert req("/api/tools")[1]["tools"]
+        assert "counters" in req("/api/metrics")[1]
+        status, err = req("/api/tasks/nope/cancel", {})
+        assert status == 404 and err["error"]["code"] == "not_found"
+        status, err = req(f"/api/tasks/{done['task_id']}/cancel", {})
+        assert status == 409 and err["error"]["code"] == "task_terminal"
+    except AssertionError:
+        raise
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    # Text endpoint check is separate because the helper expects JSON.
+    httpd = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(TaskRunner(agent), auth=AuthConfig("submit-token", "approve-token")),
+    )
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/metrics?format=prom",
+            headers={"Authorization": "Bearer submit-token"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as resp:
+            text = resp.read().decode("utf-8")
+        assert "prod_agent_" in text
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    # Approval path with audit.
+    agent = build_agent("demo", checkpoint_db=_db_path(), business_db=_db_path())
+    runner = TaskRunner(agent)
+    httpd = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(runner, auth=AuthConfig("submit-token", "approve-token")),
+    )
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        status, created = req("/api/tasks", {"goal": "message customer for order A1001"})
+        assert status == 202
+        pending = wait_status(created["task_id"], {"awaiting_approval"})
+        call_id = pending["pending_approval_ids"][0]
+        status, err = req(
+            f"/api/tasks/{created['task_id']}/approvals",
+            {"approvals": {call_id: True}},
+            token="submit-token",
+        )
+        assert status == 403
+        status, err = req(
+            f"/api/tasks/{created['task_id']}/approvals",
+            {"approvals": {"wrong": True}},
+            token="approve-token",
+        )
+        assert status == 400
+        status, _ = req(
+            f"/api/tasks/{created['task_id']}/approvals",
+            {"approvals": {call_id: True}, "approver": "alice", "reason": "ok"},
+            token="approve-token",
+        )
+        assert status == 202
+        done = wait_status(created["task_id"], {"completed"})
+        assert done["approval_audit"][0]["approver"] == "alice"
+        status, err = req(
+            f"/api/tasks/{created['task_id']}/approvals",
+            {"approvals": {call_id: True}},
+            token="approve-token",
+        )
+        assert status == 409
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    print("PASS test_http_api_auth_approval_audit_and_errors")
+
+
+def test_task_runner_exception_marks_failed():
+    from agent.server import TaskRunner, RuleBasedDemoProvider
+
+    agent = Agent(RuleBasedDemoProvider(), build_demo_tools(_db_path()), _cfg())
+    state = TaskState(goal="boom", status=TaskStatus.RUNNING)
+    agent.store.save(state)
+    runner = TaskRunner(agent)
+
+    def fail():
+        raise RuntimeError("background boom")
+
+    runner._spawn(state.task_id, fail)
+    for _ in range(50):
+        saved = agent.store.load(state.task_id)
+        if saved and saved.status == TaskStatus.FAILED:
+            break
+        time.sleep(0.02)
+    saved = agent.store.load(state.task_id)
+    assert saved is not None and saved.status == TaskStatus.FAILED
+    assert "background boom" in (saved.error or "")
+    print("PASS test_task_runner_exception_marks_failed")
+
+
 def test_context_compaction():
     msgs = [Message(role=Role.USER, content="task goal")]
     for i in range(10):
@@ -270,6 +520,64 @@ def test_metrics_bounded_histogram():
     snap = m.snapshot()["histograms"]["dur"]
     assert snap == {"count": 3, "avg": 2.0, "min": 1.0, "max": 3.0}
     print("PASS test_metrics_bounded_histogram")
+
+
+def test_agent_config_from_env():
+    keys = {
+        "PROD_AGENT_MODEL": "env-model",
+        "PROD_AGENT_MAX_TOKENS_PER_CALL": "123",
+        "PROD_AGENT_BUDGET_MAX_COST_USD": "0.5",
+        "PROD_AGENT_CONTEXT_KEEP_RECENT_MESSAGES": "3",
+        "PROD_AGENT_RATE_MAX_CALLS_PER_MINUTE": "60",
+        "PROD_AGENT_RATE_MAX_CONCURRENT_CALLS": "2",
+        "PROD_AGENT_CHECKPOINT_DB": "env.db",
+        "PROD_AGENT_ENABLE_PROMPT_CACHING": "false",
+    }
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ.update(keys)
+        cfg = AgentConfig.from_env()
+        assert cfg.model == "env-model"
+        assert cfg.max_tokens_per_call == 123
+        assert cfg.budget.max_cost_usd == 0.5
+        assert cfg.context.keep_recent_messages == 3
+        assert cfg.rate_limit == RateLimitConfig(60.0, 2)
+        assert cfg.checkpoint_db == "env.db"
+        assert cfg.enable_prompt_caching is False
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("PASS test_agent_config_from_env")
+
+
+def test_streaming_retry_does_not_duplicate_failed_attempt_text():
+    from agent.llm import LLMProvider, TransientLLMError
+
+    class FlakyStreamingProvider(LLMProvider):
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            on_text = kwargs.get("on_text")
+            if self.calls == 1:
+                if on_text:
+                    on_text("partial")
+                raise TransientLLMError("stream broke")
+            if on_text:
+                on_text("final")
+            return _resp(text="final", stop="end_turn")
+
+    chunks = []
+    provider = FlakyStreamingProvider()
+    state = Agent(provider, _tools(), _cfg()).run("stream", on_text=chunks.append)
+    assert state.status == TaskStatus.COMPLETED
+    assert chunks == ["final"]
+    assert provider.calls == 2
+    print("PASS test_streaming_retry_does_not_duplicate_failed_attempt_text")
 
 
 class _SpyProvider(MockProvider):
@@ -503,8 +811,15 @@ if __name__ == "__main__":
     test_lease_conflict_blocks_concurrent_resume()
     test_unknown_tool_and_bad_args()
     test_tool_result_truncation()
+    test_demo_business_tools_idempotency_and_approval()
+    test_rule_based_demo_provider_approval_flow()
+    test_checkpoint_list_tasks_purge_and_tool_describe()
+    test_http_api_auth_approval_audit_and_errors()
+    test_task_runner_exception_marks_failed()
     test_context_compaction()
     test_metrics_bounded_histogram()
+    test_agent_config_from_env()
+    test_streaming_retry_does_not_duplicate_failed_attempt_text()
     test_refusal_marks_failed()
     test_pause_turn_continues()
     test_cancel_task()

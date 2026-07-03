@@ -98,6 +98,20 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
+    def describe(self) -> list[dict[str, Any]]:
+        """Return tool metadata for humans and service APIs."""
+        return [
+            {
+                "name": t.name,
+                "description": t.description,
+                "permission": t.permission.value,
+                "input_schema": t.input_schema,
+                "max_result_chars": t.max_result_chars,
+                "pass_call_id": t.pass_call_id,
+            }
+            for t in self._tools.values()
+        ]
+
     def get(self, name: str) -> ToolSpec | None:
         return self._tools.get(name)
 

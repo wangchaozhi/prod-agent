@@ -118,6 +118,101 @@ python -m agent --provider openai --base-url https://api.deepseek.com --model de
 python -m agent --resume <task_id> --approvals '{"call_id": true}'
 ```
 
+## Web / HTTP API
+
+项目现在内置一个零额外依赖的本地 Web/API 壳,用于提交任务、查看状态、取消任务、审批
+EXECUTE 工具调用。默认使用规则型 `demo` provider,不需要 API Key,方便先跑通产品闭环:
+
+```bash
+python -m agent serve --provider demo --port 8000
+# 打开 http://127.0.0.1:8000
+```
+
+页面里可以试这些任务:
+
+```text
+query order A1001
+create ticket for order A1001
+message customer for order A1001
+refund A1001 10
+```
+
+其中 `message customer...` / `refund...` 会触发 EXECUTE 工具,任务进入
+`AWAITING_APPROVAL`,页面会显示 Approve / Deny 按钮;审批后服务调用
+`resume(task_id, approvals=...)` 续跑。
+
+如需保护 API,设置静态 Bearer token:
+
+```bash
+set PROD_AGENT_API_TOKEN=submit-secret
+set PROD_AGENT_APPROVAL_TOKEN=approve-secret
+python -m agent serve --provider demo
+```
+
+页面右上角可填写 token;`PROD_AGENT_APPROVAL_TOKEN` 可审批 EXECUTE 工具,
+普通 `PROD_AGENT_API_TOKEN` 不能审批。未设置 token 时为本地 demo 模式。
+
+接真实模型:
+
+```bash
+set ANTHROPIC_API_KEY=sk-...
+python -m agent serve --provider anthropic --model claude-opus-4-8
+
+set OPENAI_API_KEY=sk-...
+python -m agent serve --provider openai --base-url https://api.deepseek.com --model deepseek-chat
+```
+
+主要 API:
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/tasks` | 提交任务,body:`{"goal":"..."}` |
+| `GET` | `/api/tasks` | 最近任务列表 |
+| `GET` | `/api/tasks/{task_id}` | 任务详情、消息、pending approvals |
+| `POST` | `/api/tasks/{task_id}/approvals` | 审批,body:`{"approvals":{"call_id":true}}` |
+| `POST` | `/api/tasks/{task_id}/cancel` | 请求取消任务 |
+| `GET` | `/api/tools` | 已注册工具列表 |
+| `GET` | `/api/metrics` | 进程内 metrics 快照 |
+| `GET` | `/api/metrics?format=prom` | Prometheus 文本格式 |
+
+后台 Worker:
+
+```bash
+python -m agent worker --provider demo
+```
+
+环境变量配置示例见 `.env.example`;部署说明见 `docs/DEPLOYMENT.md`。
+
+## 内置 Demo 业务工具
+
+`agent.demo_tools.build_demo_tools()` 提供一组 SQLite 驱动的示例业务工具:
+
+| 工具 | 权限 | 作用 |
+|---|---|---|
+| `query_order` | READ | 查询单个 demo 订单 |
+| `search_orders` | READ | 搜索 demo 订单 |
+| `update_order_status` | WRITE | 更新订单状态 |
+| `create_ticket` | WRITE | 创建售后工单,支持 tool_call_id 幂等 |
+| `send_customer_message` | EXECUTE | 模拟给客户发消息,需审批 |
+| `refund_order` | EXECUTE | 模拟提交退款,需审批 |
+
+这些工具是可替换边界:生产中把函数体换成查库、调用 CRM/订单/消息/支付系统即可,
+Agent 主循环、审批、检查点、预算和日志都不用改。
+
+## 后续任务清单
+
+Web/API、Demo 工具、页面审批、静态 token 鉴权、审批审计、Prometheus metrics
+文本格式和基础部署模板已在当前版本实现。下面只保留仍需继续实现的内容:
+
+- [ ] 真实订单/用户/库存/支付/工单系统工具:需要数据库表结构或内部 API 文档
+- [ ] 真实消息通道:邮件、短信、企业微信、飞书、Slack 等 webhook/SDK
+- [ ] 完整登录鉴权与 RBAC:当前是静态 token,还没有用户体系/SSO
+- [ ] 审批系统回调:当前有审计表,还没有飞书/钉钉/工单系统卡片和回调
+- [ ] 生产级任务队列:当前是 SQLite + Worker 轮询,高并发建议接 SQS/Celery/Kafka
+- [ ] 生产级存储适配:当前 CheckpointStore 是 SQLite,多机部署建议换 Postgres/DynamoDB
+- [ ] OpenTelemetry 导出器:当前是进程内 metrics + Prometheus 文本 + JSON span
+- [ ] Kubernetes/Helm 模板:当前有 Dockerfile、Compose、systemd、nginx 示例
+
 ## 测试
 
 ```bash

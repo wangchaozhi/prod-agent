@@ -28,6 +28,16 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     cancel_requested INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_status ON checkpoints(status);
+CREATE TABLE IF NOT EXISTS approval_audit (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     TEXT NOT NULL,
+    call_id     TEXT NOT NULL,
+    approved    INTEGER NOT NULL,
+    approver    TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approval_task ON approval_audit(task_id);
 """
 
 _MIGRATION_COLUMNS = (
@@ -114,6 +124,76 @@ class CheckpointStore:
                 [s.value for s in statuses],
             ).fetchall()
         return [r[0] for r in rows]
+
+    def list_tasks(self, limit: int = 50,
+                   statuses: tuple[TaskStatus, ...] | None = None) -> list[TaskState]:
+        """Return recent tasks, newest first."""
+        limit = max(1, min(limit, 500))
+        params: list[Any] = []
+        where = ""
+        if statuses:
+            marks = ",".join("?" * len(statuses))
+            where = f"WHERE status IN ({marks})"
+            params.extend(s.value for s in statuses)
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT state_json FROM checkpoints {where} "
+                "ORDER BY updated_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [_state_from_json(r[0]) for r in rows]
+
+    def purge_terminal(self, older_than_days: float) -> int:
+        """Delete terminal tasks older than the retention window."""
+        if older_than_days < 0:
+            raise ValueError("older_than_days must be >= 0")
+        cutoff = time.time() - older_than_days * 86400
+        terminal = (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.BUDGET_EXCEEDED,
+            TaskStatus.CANCELLED,
+        )
+        marks = ",".join("?" * len(terminal))
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"DELETE FROM checkpoints WHERE status IN ({marks}) "
+                "AND updated_at < ?",
+                [s.value for s in terminal] + [cutoff],
+            )
+            return cur.rowcount
+
+    # ---------------- 审批审计 ----------------
+
+    def record_approval(self, task_id: str, call_id: str, approved: bool,
+                        approver: str = "", reason: str = "") -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO approval_audit("
+                "task_id,call_id,approved,approver,reason,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (task_id, call_id, int(approved), approver, reason, time.time()),
+            )
+
+    def list_approvals(self, task_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id,call_id,approved,approver,reason,created_at "
+                "FROM approval_audit WHERE task_id=? ORDER BY created_at ASC",
+                (task_id,),
+            ).fetchall()
+        return [
+            {
+                "task_id": row[0],
+                "call_id": row[1],
+                "approved": bool(row[2]),
+                "approver": row[3],
+                "reason": row[4],
+                "created_at": row[5],
+            }
+            for row in rows
+        ]
 
     # ---------------- 取消 ----------------
 
